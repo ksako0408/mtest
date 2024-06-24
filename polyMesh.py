@@ -1,18 +1,4 @@
-
-from read_polyMesh import \
-    read_PointsFile, \
-    read_FacesFile, \
-    read_CellFaceFile, \
-    read_CellLevelFile, \
-    read_BoundaryFile, \
-    read_Range_of_Subdomains
-import numpy as np
-from decimal import Decimal, ROUND_HALF_UP
-from operator import itemgetter
-import pprint
-import pandas as pd
-
-def read_polyMesh(processor, base_size, shift_shared, maxCellLevel_shared, lock_shared):
+def import_polyMesh(processor, base_size, shift_shared, maxCellLevel_shared, lock_shared, master_shared):
     points = read_PointsFile(processor)
     faces = read_FacesFile(processor)
     owner = read_CellFaceFile(processor, "owner")
@@ -49,8 +35,6 @@ def read_polyMesh(processor, base_size, shift_shared, maxCellLevel_shared, lock_
                           int(Decimal(v[2]).quantize(Decimal('0'), rounding=ROUND_HALF_UP))), \
                           dtype = np.int32) for i, v in enumerate(p)}
 
-
-
     owner_face = np.arange(len(owner), dtype = np.int32)
     neighbour_face = np.arange(len(neighbour), dtype = np.int32)
     face_list = np.append(owner_face, neighbour_face)
@@ -59,31 +43,27 @@ def read_polyMesh(processor, base_size, shift_shared, maxCellLevel_shared, lock_
     neighbour_cell = np.array(neighbour, dtype = np.int32)
     cell_list = np.append(owner_cell, neighbour_cell)
 
-    polyMesh_df = pd.DataFrame(
+    Master_df = pd.DataFrame(
         {
             "cell": cell_list,
             "face": face_list,
         }
     )
 
-
-
     unique_face_list = np.unique(face_list)
     unique_face_point_dict = {n: np.array([normalized_points[p] for p in faces[n]]) for n in unique_face_list}
     unique_face_minmax_dict = {n: np.append(np.min(p, axis = 0), np.max(p, axis = 0)) for n, p in unique_face_point_dict.items()}
     face_minmax_list = np.array([unique_face_minmax_dict[n] for n in face_list])
 
-    polyMesh_df["fxmin"] = face_minmax_list[:, 0]
-    polyMesh_df["fymin"] = face_minmax_list[:, 1]
-    polyMesh_df["fzmin"] = face_minmax_list[:, 2]
-    polyMesh_df["fxmax"] = face_minmax_list[:, 3]
-    polyMesh_df["fymax"] = face_minmax_list[:, 4]
-    polyMesh_df["fzmax"] = face_minmax_list[:, 5]
+    Master_df["fxmin"] = face_minmax_list[:, 0]
+    Master_df["fymin"] = face_minmax_list[:, 1]
+    Master_df["fzmin"] = face_minmax_list[:, 2]
+    Master_df["fxmax"] = face_minmax_list[:, 3]
+    Master_df["fymax"] = face_minmax_list[:, 4]
+    Master_df["fzmax"] = face_minmax_list[:, 5]
 
-
-
-    pmin_df = polyMesh_df[["cell", "fxmin", "fymin", "fzmin"]].groupby("cell").min()
-    pmax_df = polyMesh_df[["cell", "fxmax", "fymax", "fzmax"]].groupby("cell").max()
+    pmin_df = Master_df[["cell", "fxmin", "fymin", "fzmin"]].groupby("cell").min()
+    pmax_df = Master_df[["cell", "fxmax", "fymax", "fzmax"]].groupby("cell").max()
 
     unique_cell_index = np.array(pmin_df.index, dtype = np.int32)
     pmin = np.array(pmin_df)
@@ -91,11 +71,10 @@ def read_polyMesh(processor, base_size, shift_shared, maxCellLevel_shared, lock_
     pmean = np.array([pmin, pmax]).mean(axis = 0, dtype = np.int32)
     size = (pmax - pmin)[:, 0]
 
-    polyMesh_df["size"] = np.array([size[n] for n in cell_list])
-    polyMesh_df["nx"] = np.array([pmean[n] for n in cell_list])[:, 0]
-    polyMesh_df["ny"] = np.array([pmean[n] for n in cell_list])[:, 1]
-    polyMesh_df["nz"] = np.array([pmean[n] for n in cell_list])[:, 2]
-
+    Master_df["size"] = np.array([size[n] for n in cell_list])
+    Master_df["nx"] = np.array([pmean[n] for n in cell_list])[:, 0]
+    Master_df["ny"] = np.array([pmean[n] for n in cell_list])[:, 1]
+    Master_df["nz"] = np.array([pmean[n] for n in cell_list])[:, 2]
 
 
     def fcsys(pn, fmin, fmax):
@@ -105,13 +84,12 @@ def read_polyMesh(processor, base_size, shift_shared, maxCellLevel_shared, lock_
         sys = np.array([[1, 3], [2, 4], [5, 6]])
         return sys[bl][0][[nc < nf, nf < nc]][0]
 
-    pn = np.array(polyMesh_df[["nx", "ny", "nz"]])
-    fmin = np.array(polyMesh_df[["fxmin", "fymin", "fzmin"]])
-    fmax = np.array(polyMesh_df[["fxmax", "fymax", "fzmax"]])
+    pn = np.array(Master_df[["nx", "ny", "nz"]])
+    fmin = np.array(Master_df[["fxmin", "fymin", "fzmin"]])
+    fmax = np.array(Master_df[["fxmax", "fymax", "fzmax"]])
 
     fcsys_list = np.array([fcsys(p, fm, fx) for p, fm, fx in zip(pn, fmin, fmax)], dtype = np.int32)
-    polyMesh_df["fcsys"] = fcsys_list
-
+    Master_df["fcsys"] = fcsys_list
 
 
     nInternalFaces = len(neighbour)
@@ -120,20 +98,50 @@ def read_polyMesh(processor, base_size, shift_shared, maxCellLevel_shared, lock_
     endFace = startFace + nFaces
     boundaryType = [v["type"] for v in boundaries]
     boundaryName = [v["name"] for v in boundaries]
-    def face_condition(faceNo):
+    def face_type(faceNo, pn, fmin, fmax):
+        post_fix = ""
+        if np.any(fmin == pn) or np.any(fmax == pn): post_fix = "_mbFine"
         if faceNo < nInternalFaces:
-            return ["InternalFace", "None"]
+            return ["InternalFace" + post_fix, "None"]
         k = np.argmax(np.all([startFace <= faceNo, faceNo < endFace], axis = 0))
-        return [boundaryType[k], boundaryName[k]]
+        return [boundaryType[k] + post_fix, boundaryName[k]]
 
-    face_condition_list = np.array(list(map(face_condition, face_list)))
-    polyMesh_df["boundaryType"] = face_condition_list[:, 0]
-    polyMesh_df["boundaryName"] = face_condition_list[:, 1]
-
-
+    face_type_list = np.array(list(map(face_type, face_list, pn, fmin, fmax)))
+    Master_df["boundaryType"] = pd.Series(face_type_list[:, 0], dtype = "string")
+    Master_df["boundaryName"] = pd.Series(face_type_list[:, 1], dtype = "string")
 
 
+    is_mbFine = np.array(Master_df["boundaryType"] == "InternalFace_mbFine")
+    face_mbFine = np.array(Master_df["face"][is_mbFine])
+    _ = face_mbFine.reshape([len(face_mbFine), -1])
+    is_duplicate_face = np.any(face_list == _, axis = 0)
+    is_mbCoarse = is_duplicate_face ^ is_mbFine
+    before = Master_df["boundaryType"].tolist()
+    after = np.where(is_mbCoarse, "InternalFace_mbCoarse", before)
+    Master_df["boundaryType"] = pd.Series(after, dtype = "string")
 
+    Master_df["processor"] = int(processor.replace("processor", ""))
+    Master_df["processor"] = Master_df["processor"].astype("int32")
+
+    master_shared[processor] = Master_df
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def generate_LinkWiseLattice():
     amp = size.reshape([len(size), 1])
     pcsys_dict = {n: pmean + (amp * np.array(v)) for n, v in csys.items()}
     tmp_list = np.concatenate(list(pcsys_dict.values()))
@@ -172,11 +180,29 @@ def read_polyMesh(processor, base_size, shift_shared, maxCellLevel_shared, lock_
 
 
 
-
-
 if __name__ == '__main__':
     from multiprocessing import Process, Manager, Array, Value, Lock
+    import logging
     import time
+
+    logger = logging.getLogger(__name__)
+    # logger.propagate = False
+    logger.setLevel(logging.DEBUG)
+
+    handler = logging.StreamHandler()
+    format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(format)
+    # handler.setLevel(logging.INFO)
+
+    logger.addHandler(handler)
+    # logging.basicConfig()
+
+    # logger.debug('Debug')
+    # logger.info('Informarion')
+    # logger.warning('Warning')
+    # logger.error('Error')
+    # logger.critical('Critical')
+
 
     base_size = 1.0
     print()
@@ -186,19 +212,20 @@ if __name__ == '__main__':
     array = Array("f", 3)
     value = Value("i", 0)
     manager = Manager()
-    pmesh_dict = manager.dict()
+    master_shared = manager.dict()
     lock = Lock()
     process_list = list()
     for i in range(4):
         processor = "processor" + str(i)
         process = Process(
-            target = read_polyMesh,
+            target = import_polyMesh,
             kwargs = {
                 "processor": processor,
                 "base_size": base_size,
                 "shift_shared": array,
                 "maxCellLevel_shared": value,
                 "lock_shared": lock,
+                "master_shared": master_shared,
             }
         )
         process.start()
@@ -209,11 +236,3 @@ if __name__ == '__main__':
 
     end = time.perf_counter()
     print(f"Done.\n (elapsed Time: {end - start} sec.)")
-
-
-
-
-
-
-
-    # read_polyMesh("processor0")
