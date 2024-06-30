@@ -65,7 +65,6 @@ def import_polyMesh(processor, base_size, shift_shared, maxCellLevel_shared, loc
     pmin_df = Master_df[["cell", "fxmin", "fymin", "fzmin"]].groupby("cell").min()
     pmax_df = Master_df[["cell", "fxmax", "fymax", "fzmax"]].groupby("cell").max()
 
-    unique_cell_index = np.array(pmin_df.index, dtype = np.int32)
     pmin = np.array(pmin_df)
     pmax = np.array(pmax_df)
     pmean = np.array([pmin, pmax]).mean(axis = 0, dtype = np.int32)
@@ -126,28 +125,45 @@ def import_polyMesh(processor, base_size, shift_shared, maxCellLevel_shared, loc
     master_shared[processor] = Master_df
 
 
+def find_processor_mbFine(processor, master_shared):
+
+    Master_df = master_shared[processor]
+    other_master_dict = {proc: df for proc, df in master_shared.items() if not proc == processor}
+
+    findex = ["fxmin", "fymin", "fzmin", "fxmax", "fymax", "fzmax", "size"]
+    boundaryType = np.array(Master_df["boundaryType"])
+    boundaryName = np.array(Master_df["boundaryName"])
+    is_processor = boundaryType == "processor"
+    p = re.compile("[a-zA-Z]+[0-9]+to")
+    processorName = [p.sub("processor", n) for n in boundaryName[is_processor]]
+    processor_findex = np.array(Master_df[findex])[is_processor]
+    processor_findex[:,6] = 2 * processor_findex[:,6]
+    other_processor_findex = {n: np.array(df[df["boundaryType"] == "processor_mbFine"][findex]) for n, df in other_master_dict.items()}
+    is_mbCoarse = [findex in other_processor_findex[proc] for proc, findex in zip(processorName, processor_findex)]
+
+    boundaryType[is_processor] = np.where(is_mbCoarse, "processor_mbCoarse", "processor")
+    Master_df["boundaryType"] = boundaryType
+    master_shared[processor] = Master_df
 
 
+def generate_LinkWiseLattice(processor, master_shared, meshes_shared):
 
+    Master_df = master_shared[processor]
 
+    size_Series = np.array(Master_df["size"])
+    pn_Series = np.array(Master_df[["nx", "ny", "nz"]])
+    cell_Series = np.array(Master_df["cell"])
 
+    unique_cell_index, indices = np.unique(cell_Series, return_index = True)
+    size = size_Series[indices]
+    pn = pn_Series[indices]
 
-
-
-
-
-
-
-
-
-
-def generate_LinkWiseLattice():
     amp = size.reshape([len(size), 1])
-    pcsys_dict = {n: pmean + (amp * np.array(v)) for n, v in csys.items()}
+    pcsys_dict = {n: pn + (amp * np.array(v)) for n, v in csys.items()}
     tmp_list = np.concatenate(list(pcsys_dict.values()))
-    tmp_list = np.concatenate([pmean, tmp_list])
+    tmp_list = np.concatenate([pn, tmp_list])
     tmp_list = np.array(pd.DataFrame(data = tmp_list).drop_duplicates())
-    tmp_list = np.concatenate([pmean, tmp_list])
+    tmp_list = np.concatenate([pn, tmp_list])
     ghostCell_df = pd.DataFrame(data = tmp_list).drop_duplicates(keep = False)
     ghostCell = np.array(ghostCell_df)
 
@@ -155,28 +171,56 @@ def generate_LinkWiseLattice():
     ne = ns + len(ghostCell_df)
     unique_ghost_index = np.arange(ns, ne, dtype = np.int32)
 
-    tmp_cell = np.concatenate([pmean, ghostCell])
+    tmp_cell = np.concatenate([pn, ghostCell])
     tmp_index = np.append(unique_cell_index, unique_ghost_index)
     pinv = {tuple(v): n for n, v in zip(tmp_index, tmp_cell)}
-    pcsys_tuple = tuple(map(tuple, np.concatenate([pcsys_dict[k] for k in sorted(list(csys.keys()))])))
+    pcsys_tuple = tuple(map(tuple, np.concatenate([pcsys_dict[k] for k in np.arange(1,27)])))
 
     ncell = len(unique_cell_index)
     csys_cell_index = np.array([pinv[v] for v in pcsys_tuple], dtype = np.int32).reshape([ncell, -1], order = "F")
     csys_cell_df = pd.DataFrame(csys_cell_index).add_prefix("csys_")
     csys_cell_df["cell"] = unique_cell_index
 
-
     Link_Wise_Lattice = pd.DataFrame(
         {
             "cell": unique_cell_index,
             "size": size,
-            "nx": pmean[:,0],
-            "ny": pmean[:,1],
-            "nz": pmean[:,2],
+            "nx": pn[:,0],
+            "ny": pn[:,1],
+            "nz": pn[:,2],
         }
     )
 
     Link_Wise_Lattice = Link_Wise_Lattice.merge(csys_cell_df)
+    meshes_shared[processor] = Link_Wise_Lattice
+
+
+
+
+def boundary_condition(processor, master_shared, meshes_shared):
+
+    Master_df = master_shared[processor]
+    other_master_dict = {proc: df for proc, df in master_shared.items() if not proc == processor}
+    Lattice_df = meshes_shared[processor]
+
+    unique_cell_list = np.array(Lattice_df["cell"])
+    csys_cell_array = np.array(Lattice_df.filter(like = "csys_", axis = 1))
+    nInternalCell = np.max(unique_cell_list)
+    nGhostCell = np.max(csys_cell_array)
+    unique_ghost_list = np.arange(nInternalCell + 1, nGhostCell + 1, dtype = np.int32)
+
+
+
+    if processor == "processor0":
+        print(Master_df)
+        print("")
+        print(Lattice_df)
+        print(nInternalCell, nGhostCell)
+        print(unique_ghost_list)
+
+
+
+
 
 
 
@@ -205,8 +249,14 @@ if __name__ == '__main__':
 
 
     base_size = 1.0
+    nProc = 4
     print()
+
+
     # print(f"Importing OpenFOAM polyMesh ...", end=" ")
+
+    processor_list = ["processor" + str(i) for i in range(nProc)]
+
     print(f"Importing OpenFOAM polyMesh ...")
     start = time.perf_counter()
     array = Array("f", 3)
@@ -215,8 +265,9 @@ if __name__ == '__main__':
     master_shared = manager.dict()
     lock = Lock()
     process_list = list()
-    for i in range(4):
-        processor = "processor" + str(i)
+    # for i in range(nProc):
+    for processor in processor_list:
+        # processor = "processor" + str(i)
         process = Process(
             target = import_polyMesh,
             kwargs = {
@@ -234,5 +285,72 @@ if __name__ == '__main__':
     for process in process_list:
         process.join()
 
+
+    process_list = list()
+    # for i in range(nProc):
+    for processor in processor_list:
+        # processor = "processor" + str(i)
+        process = Process(
+            target = find_processor_mbFine,
+            kwargs = {
+                "processor": processor,
+                "master_shared": master_shared,
+            }
+        )
+        process.start()
+        process_list.append(process)
+
+    for process in process_list:
+        process.join()
+
+
+    meshes_shared = manager.dict()
+    process_list = list()
+    # for i in range(nProc):
+    for processor in processor_list:
+        # processor = "processor" + str(i)
+        process = Process(
+            target = generate_LinkWiseLattice,
+            kwargs = {
+                "processor": processor,
+                "master_shared": master_shared,
+                "meshes_shared": meshes_shared,
+            }
+        )
+        process.start()
+        process_list.append(process)
+
+    for process in process_list:
+        process.join()
+
+
+    process_list = list()
+    # for i in range(nProc):
+    for processor in processor_list:
+        # processor = "processor" + str(i)
+        process = Process(
+            target = boundary_condition,
+            kwargs = {
+                "processor": processor,
+                "master_shared": master_shared,
+                "meshes_shared": meshes_shared,
+            }
+        )
+        process.start()
+        process_list.append(process)
+
+    for process in process_list:
+        process.join()
+
+
+
+
+
+
+
+
+
     end = time.perf_counter()
     print(f"Done.\n (elapsed Time: {end - start} sec.)")
+
+
