@@ -198,27 +198,73 @@ def generate_LinkWiseLattice(processor, master_shared, meshes_shared):
 
 
 def boundary_condition(processor, master_shared, meshes_shared):
-
-    Master_df = master_shared[processor]
-    other_master_dict = {proc: df for proc, df in master_shared.items() if not proc == processor}
+    all_master_df = [df for df in master_shared.values()]
+    all_processor = list(master_shared.keys())
     Lattice_df = meshes_shared[processor]
+    Master_df = master_shared[processor]
 
-    unique_cell_list = np.array(Lattice_df["cell"])
-    csys_cell_array = np.array(Lattice_df.filter(like = "csys_", axis = 1))
-    nInternalCell = np.max(unique_cell_list)
-    nGhostCell = np.max(csys_cell_array)
-    unique_ghost_list = np.arange(nInternalCell + 1, nGhostCell + 1, dtype = np.int32)
+    csys_array = np.array(Lattice_df.filter(like = "csys_", axis = 1))
+    size = np.array(Lattice_df["size"])
+    pn = np.array(Lattice_df[["nx", "ny", "nz"]])
+    unique_innerCell_list = np.array(Lattice_df["cell"])
+    n_innerCell = np.max(unique_innerCell_list)
+    n_ghostCell = np.max(csys_array)
+    unique_ghostCell_list = np.arange(n_innerCell + 1, n_ghostCell + 1, dtype = np.int32)
+
+    # _list = csys_array[:, :6].flatten()
+    # face_contact_ghostCell = np.unique(_list[_list > n_innerCell])
+    _list = csys_array[:, :6]
+    face_contact_ghostCell = np.unique(_list[_list > n_innerCell])
+    _list = [np.argwhere(csys_array == gc)[0] for gc in face_contact_ghostCell]
+    # pn_face_contact_ghostCell = np.array([pn[n] + (size[n] * np.array(csys[i + 1])) for n, i in _list])
+
+    # _list = np.append(face_contact_ghostCell, unique_ghostCell_list)
+    # edge_contact_ghostCell = np.array(pd.Series(data = _list).drop_duplicates(keep = False))
+    # _list = [np.argwhere(csys_array == gc)[0] for gc in edge_contact_ghostCell]
+    # pn_edge_contact_ghostCell = np.array([pn[n] + (size[n] * np.array(csys[i + 1])) for n, i in _list])
+
+    # _list = csys_array[:, 6:].flatten()
+    # _list = np.unique(_list[_list > n_innerCell])
+    # intersect_contact_ghostCell = np.intersect1d(_list, face_contact_ghostCell)
+    # _list = [np.argwhere(csys_array == gc)[0] for gc in intersect_contact_ghostCell]
+    # pn_intersect_contact_ghostCell = np.array([pn[n] + (size[n] * np.array(csys[i + 1])) for n, i in _list])
 
 
+    # _df = Master_df[["cell", "fcsys", "boundaryType", "boundaryName"]].query("boundaryType != 'InternalFace'")
+    # cells = np.array(_df["cell"])
+    # fcsys = np.array(_df["fcsys"])
+    # boundaryTypes = np.array(_df["boundaryType"])
+    # boundaryNames = np.array(_df["boundaryName"])
+
+    # _list = [[csys_array[n][k-1], n, csys_inv[k], boundaryType, boundaryName]
+    #          for n, k, boundaryType, boundaryName in zip(cells, fcsys, boundaryTypes, boundaryNames)] 
+    # ghostCell_df = pd.DataFrame(_list).set_axis(["ghostCell", "cell", "csys", "boundaryType", "boundaryName"], axis = "columns")
+
+
+
+    # all_pmin = np.concatenate([np.array(df[["cell", "fxmin", "fymin", "fzmin"]].groupby("cell").min()) for df in all_master_df])
+    # all_pmax = np.concatenate([np.array(df[["cell", "fxmax", "fymax", "fzmax"]].groupby("cell").max()) for df in all_master_df])
+    # all_proc = np.concatenate([np.array(df[["cell", "processor"]].groupby("cell", as_index = False).max()) for df in all_master_df])
+
+    # is_included = np.array(
+    #     [np.all([all_pmin[:, 0] <= gc[0], gc[0] <= all_pmax[:, 0],
+    #              all_pmin[:, 1] <= gc[1], gc[1] <= all_pmax[:, 1],
+    #              all_pmin[:, 2] <= gc[2], gc[2] <= all_pmax[:, 2]
+    #              ], axis = 0) for gc in pn_edge_contact_ghostCell]
+    # )
+
+    # all_cell_index = all_proc[:, 0]
+    # all_proc_index = all_proc[:, 1]
+    # cell_related_unDefined_GCell = [all_cell_index[isin] for isin in is_included]
+    # proc_related_unDefined_GCell = [all_proc_index[isin] for isin in is_included]
 
     if processor == "processor0":
-        print(Master_df)
         print("")
-        print(Lattice_df)
-        print(nInternalCell, nGhostCell)
-        print(unique_ghost_list)
-
-
+        # print(ghostCell_df)
+        # print(ghostCell_df.drop_duplicates(subset = ["ghostCell", "csys"]))
+        # print(  len(tmp_df.drop_duplicates(subset = ["cell", "fcsys"])) )
+        # print(tmp_df)
+        # pprint.pprint(cell_related_unDefined_GCell)
 
 
 
