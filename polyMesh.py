@@ -1,34 +1,26 @@
-def import_polyMesh(processor, base_size, shift_shared, maxCellLevel_shared, lock_shared, master_shared):
+def SubdomainRange(processor, range_shared):
+    points = read_PointsFile(processor)
+    cellLevel = read_CellLevelFile(processor)
+    min_SubdomainRange, max_SubdomainRange = read_Range_of_Subdomains(points)
+    xmin, ymin, zmin = min_SubdomainRange
+    xmax, ymax, zmax = max_SubdomainRange
+    range_shared[processor] = {"min": (xmin, ymin, zmin), "max": (xmax, ymax, zmax), "max_cellLevel": max(cellLevel)}
+
+    np.set_printoptions(precision = 8, floatmode = "fixed", suppress = True)
+    print(f"\t{processor}: min: {np.array(min_SubdomainRange)}, max: {np.array(max_SubdomainRange)}")
+
+
+def import_polyMesh(processor, base_size, shift, max_cellLevel, master_shared):
     points = read_PointsFile(processor)
     faces = read_FacesFile(processor)
     owner = read_CellFaceFile(processor, "owner")
     neighbour = read_CellFaceFile(processor, "neighbour")
-    cellLevel = read_CellLevelFile(processor)
     boundaries = read_BoundaryFile(processor)
-
-    min_SubdomainRange, max_SubdomainRange = read_Range_of_Subdomains(points)
-
-    lock_shared.acquire()
-    try:
-        if processor == "processor0":
-            x, y, z = min_SubdomainRange
-            shift_shared = (x, y, z)
-    finally:
-        lock_shared.release()
-    shift_shared = np.array(shift_shared)
-
-    lock_shared.acquire()
-    try:
-        tmp = max(cellLevel)
-        maxCellLevel_shared.value = max([maxCellLevel_shared.value, tmp])
-    finally:
-        lock_shared.release()
-    max_cellLevel = maxCellLevel_shared.value
 
     normalized_Length = (2 ** (max_cellLevel + 1)) / base_size
 
     p = np.array(points)
-    p = (p - shift_shared) * normalized_Length
+    p = (p - shift) * normalized_Length
     normalized_points = {i: np.array(
                          (int(Decimal(v[0]).quantize(Decimal('0'), rounding=ROUND_HALF_UP)), \
                           int(Decimal(v[1]).quantize(Decimal('0'), rounding=ROUND_HALF_UP)), \
@@ -75,7 +67,6 @@ def import_polyMesh(processor, base_size, shift_shared, maxCellLevel_shared, loc
     Master_df["ny"] = np.array([pmean[n] for n in cell_list])[:, 1]
     Master_df["nz"] = np.array([pmean[n] for n in cell_list])[:, 2]
 
-
     def fcsys(pn, fmin, fmax):
         bl = fmin == fmax
         nc = pn[bl][0]
@@ -97,6 +88,7 @@ def import_polyMesh(processor, base_size, shift_shared, maxCellLevel_shared, loc
     endFace = startFace + nFaces
     boundaryType = [v["type"] for v in boundaries]
     boundaryName = [v["name"] for v in boundaries]
+
     def face_type(faceNo, pn, fmin, fmax):
         post_fix = ""
         if np.any(fmin == pn) or np.any(fmax == pn): post_fix = "_mbFine"
@@ -146,7 +138,7 @@ def find_processor_mbFine(processor, master_shared):
     master_shared[processor] = Master_df
 
 
-def generate_LinkWiseLattice(processor, master_shared, meshes_shared):
+def generate_LinkWiseLattice(processor, master_shared, meshes_shared, ghosts_shared):
 
     Master_df = master_shared[processor]
 
@@ -164,11 +156,11 @@ def generate_LinkWiseLattice(processor, master_shared, meshes_shared):
     tmp_list = np.concatenate([pn, tmp_list])
     tmp_list = np.array(pd.DataFrame(data = tmp_list).drop_duplicates())
     tmp_list = np.concatenate([pn, tmp_list])
-    ghostCell_df = pd.DataFrame(data = tmp_list).drop_duplicates(keep = False)
-    ghostCell = np.array(ghostCell_df)
+    pn_ghostCell_df = pd.DataFrame(data = tmp_list).drop_duplicates(keep = False)
+    ghostCell = np.array(pn_ghostCell_df)
 
     ns = np.max(unique_cell_index) + 1
-    ne = ns + len(ghostCell_df)
+    ne = ns + len(pn_ghostCell_df)
     unique_ghost_index = np.arange(ns, ne, dtype = np.int32)
 
     tmp_cell = np.concatenate([pn, ghostCell])
@@ -178,7 +170,8 @@ def generate_LinkWiseLattice(processor, master_shared, meshes_shared):
 
     ncell = len(unique_cell_index)
     csys_cell_index = np.array([pinv[v] for v in pcsys_tuple], dtype = np.int32).reshape([ncell, -1], order = "F")
-    csys_cell_df = pd.DataFrame(csys_cell_index).add_prefix("csys_")
+    csys_cell_df = pd.DataFrame(csys_cell_index)
+    csys_cell_df = csys_cell_df.set_axis(["csys_" + str(i) for i in range(1,27)], axis = "columns")
     csys_cell_df["cell"] = unique_cell_index
 
     Link_Wise_Lattice = pd.DataFrame(
@@ -194,28 +187,76 @@ def generate_LinkWiseLattice(processor, master_shared, meshes_shared):
     Link_Wise_Lattice = Link_Wise_Lattice.merge(csys_cell_df)
     meshes_shared[processor] = Link_Wise_Lattice
 
+    pn_ghostCell_df = pn_ghostCell_df.set_axis(["nx", "ny", "nx"], axis = "columns")
+    pn_ghostCell_df["ghostCell"] = unique_ghost_index
+    ghosts_shared[processor] = pn_ghostCell_df
 
 
-
-def boundary_condition(processor, master_shared, meshes_shared):
-    all_master_df = [df for df in master_shared.values()]
+def boundary_condition(processor, master_shared, meshes_shared, ghosts_shared):
     all_processor = list(master_shared.keys())
     Lattice_df = meshes_shared[processor]
     Master_df = master_shared[processor]
+    pn_ghost_df = ghosts_shared[processor]
 
     csys_array = np.array(Lattice_df.filter(like = "csys_", axis = 1))
     size = np.array(Lattice_df["size"])
     pn = np.array(Lattice_df[["nx", "ny", "nz"]])
     unique_innerCell_list = np.array(Lattice_df["cell"])
     n_innerCell = np.max(unique_innerCell_list)
-    n_ghostCell = np.max(csys_array)
-    unique_ghostCell_list = np.arange(n_innerCell + 1, n_ghostCell + 1, dtype = np.int32)
+    unique_ghostCell_list = np.array(pn_ghost_df["ghostCell"])
 
-    # _list = csys_array[:, :6].flatten()
+    _df = Master_df[["cell", "fcsys", "boundaryType", "boundaryName"]].query("boundaryType != 'InternalFace'")
+    cells = np.array(_df["cell"])
+    fcsys = np.array(_df["fcsys"])
+    boundaryTypes = np.array(_df["boundaryType"])
+    boundaryNames = np.array(_df["boundaryName"])
+
+    _list = [[csys_array[n][k-1], n, csys_inv[k], boundaryType, boundaryName]
+             for n, k, boundaryType, boundaryName in zip(cells, fcsys, boundaryTypes, boundaryNames)] 
+    face_contact_ghostCell_df = pd.DataFrame(_list).set_axis(["ghostCell", "cell", "csys", "boundaryType", "boundaryName"], axis = "columns")
+
+
+    _list = np.unique(np.array(face_contact_ghostCell_df["ghostCell"]))
+    _list = np.append(_list, unique_ghostCell_list)
+    edge_contact_ghostCell = np.array(pd.Series(data = _list).drop_duplicates(keep = False))
+
+
+    csys_array_flatten = csys_array.flatten()
+    _dict = {k: list() for k in csys_array_flatten}
+    [_dict[k].append(i) for i, k in enumerate(csys_array_flatten)]
+    _list = np.array([np.append(np.array(gn), np.divmod(ks, 26, dtype = np.int32)) for gn in unique_ghostCell_list for ks in _dict[gn]])
+    _df = pd.DataFrame(_list)
+
+
+    if processor == "processor0":
+        print(_list)
+        print(_list.shape)
+        print(_df)
+
+
+
+
+    pn_ghost_dict = {gn: (nx, ny, nz) for nx, ny, nz, gn in np.array(pn_ghost_df)}
+    pn_edge_ghost_dict = {pn_ghost_dict[gn]: gn for gn in edge_contact_ghostCell}
+
+    all_master_df = [df for df in master_shared.values()]
+    all_pmin = np.concatenate([np.array(df[["cell", "fxmin", "fymin", "fzmin"]].groupby("cell").min()) for df in all_master_df])
+    all_pmax = np.concatenate([np.array(df[["cell", "fxmax", "fymax", "fzmax"]].groupby("cell").max()) for df in all_master_df])
+    all_proc = np.concatenate([np.array(df[["cell", "processor"]].groupby("cell", as_index = False).max()) for df in all_master_df])
+
+    is_included = np.array(
+        [np.all([all_pmin[:, 0] <= gn[0], gn[0] <= all_pmax[:, 0],
+                 all_pmin[:, 1] <= gn[1], gn[1] <= all_pmax[:, 1],
+                 all_pmin[:, 2] <= gn[2], gn[2] <= all_pmax[:, 2]
+                 ], axis = 0) for gn in pn_edge_ghost_dict])
+
+
+
+
+
+    # _list = csys_array[:, :6]
     # face_contact_ghostCell = np.unique(_list[_list > n_innerCell])
-    _list = csys_array[:, :6]
-    face_contact_ghostCell = np.unique(_list[_list > n_innerCell])
-    _list = [np.argwhere(csys_array == gc)[0] for gc in face_contact_ghostCell]
+    # _list = [np.argwhere(csys_array == gc)[0] for gc in face_contact_ghostCell]
     # pn_face_contact_ghostCell = np.array([pn[n] + (size[n] * np.array(csys[i + 1])) for n, i in _list])
 
     # _list = np.append(face_contact_ghostCell, unique_ghostCell_list)
@@ -223,35 +264,14 @@ def boundary_condition(processor, master_shared, meshes_shared):
     # _list = [np.argwhere(csys_array == gc)[0] for gc in edge_contact_ghostCell]
     # pn_edge_contact_ghostCell = np.array([pn[n] + (size[n] * np.array(csys[i + 1])) for n, i in _list])
 
-    # _list = csys_array[:, 6:].flatten()
+    # _list = csys_array[:, 6:]
     # _list = np.unique(_list[_list > n_innerCell])
     # intersect_contact_ghostCell = np.intersect1d(_list, face_contact_ghostCell)
     # _list = [np.argwhere(csys_array == gc)[0] for gc in intersect_contact_ghostCell]
     # pn_intersect_contact_ghostCell = np.array([pn[n] + (size[n] * np.array(csys[i + 1])) for n, i in _list])
 
 
-    # _df = Master_df[["cell", "fcsys", "boundaryType", "boundaryName"]].query("boundaryType != 'InternalFace'")
-    # cells = np.array(_df["cell"])
-    # fcsys = np.array(_df["fcsys"])
-    # boundaryTypes = np.array(_df["boundaryType"])
-    # boundaryNames = np.array(_df["boundaryName"])
 
-    # _list = [[csys_array[n][k-1], n, csys_inv[k], boundaryType, boundaryName]
-    #          for n, k, boundaryType, boundaryName in zip(cells, fcsys, boundaryTypes, boundaryNames)] 
-    # ghostCell_df = pd.DataFrame(_list).set_axis(["ghostCell", "cell", "csys", "boundaryType", "boundaryName"], axis = "columns")
-
-
-
-    # all_pmin = np.concatenate([np.array(df[["cell", "fxmin", "fymin", "fzmin"]].groupby("cell").min()) for df in all_master_df])
-    # all_pmax = np.concatenate([np.array(df[["cell", "fxmax", "fymax", "fzmax"]].groupby("cell").max()) for df in all_master_df])
-    # all_proc = np.concatenate([np.array(df[["cell", "processor"]].groupby("cell", as_index = False).max()) for df in all_master_df])
-
-    # is_included = np.array(
-    #     [np.all([all_pmin[:, 0] <= gc[0], gc[0] <= all_pmax[:, 0],
-    #              all_pmin[:, 1] <= gc[1], gc[1] <= all_pmax[:, 1],
-    #              all_pmin[:, 2] <= gc[2], gc[2] <= all_pmax[:, 2]
-    #              ], axis = 0) for gc in pn_edge_contact_ghostCell]
-    # )
 
     # all_cell_index = all_proc[:, 0]
     # all_proc_index = all_proc[:, 1]
@@ -260,13 +280,16 @@ def boundary_condition(processor, master_shared, meshes_shared):
 
     if processor == "processor0":
         print("")
-        # print(ghostCell_df)
-        # print(ghostCell_df.drop_duplicates(subset = ["ghostCell", "csys"]))
-        # print(  len(tmp_df.drop_duplicates(subset = ["cell", "fcsys"])) )
+        # print(_dict)
+        # print(ghost_pn_df)
+        # print(len(unique_ghostCell_list), len(face_contact_ghostCell), len(edge_contact_ghostCell), len(intersect_contact_ghostCell))
+        # findex =np.array(face_contact_ghostCell_df["ghostCell"])
+        # for n in findex:
+        #     if not n in unique_ghostCell_list: print(n)
+        # print(len(np.unique(np.array(face_contact_ghostCell_df["ghostCell"]))))
+        # print(len(edge_contanct_ghostCell))
         # print(tmp_df)
         # pprint.pprint(cell_related_unDefined_GCell)
-
-
 
 
 
@@ -302,26 +325,40 @@ if __name__ == '__main__':
     # print(f"Importing OpenFOAM polyMesh ...", end=" ")
 
     processor_list = ["processor" + str(i) for i in range(nProc)]
+    manager = Manager()
 
     print(f"Importing OpenFOAM polyMesh ...")
-    start = time.perf_counter()
-    array = Array("f", 3)
-    value = Value("i", 0)
-    manager = Manager()
-    master_shared = manager.dict()
-    lock = Lock()
+
+    range_shared = manager.dict()
     process_list = list()
-    # for i in range(nProc):
     for processor in processor_list:
-        # processor = "processor" + str(i)
+        process = Process(
+            target = SubdomainRange,
+            kwargs = {
+                "processor": processor,
+                "range_shared": range_shared,
+            }
+        )
+        process.start()
+        process_list.append(process)
+
+    for process in process_list:
+        process.join()
+
+
+    start = time.perf_counter()
+    shift = range_shared["processor0"]["min"]
+    max_cellLevel = range_shared["processor0"]["max_cellLevel"]
+    master_shared = manager.dict()
+    process_list = list()
+    for processor in processor_list:
         process = Process(
             target = import_polyMesh,
             kwargs = {
                 "processor": processor,
                 "base_size": base_size,
-                "shift_shared": array,
-                "maxCellLevel_shared": value,
-                "lock_shared": lock,
+                "shift": shift,
+                "max_cellLevel": max_cellLevel,
                 "master_shared": master_shared,
             }
         )
@@ -351,6 +388,7 @@ if __name__ == '__main__':
 
 
     meshes_shared = manager.dict()
+    ghosts_shared = manager.dict()
     process_list = list()
     # for i in range(nProc):
     for processor in processor_list:
@@ -361,6 +399,7 @@ if __name__ == '__main__':
                 "processor": processor,
                 "master_shared": master_shared,
                 "meshes_shared": meshes_shared,
+                "ghosts_shared": ghosts_shared,
             }
         )
         process.start()
@@ -380,6 +419,7 @@ if __name__ == '__main__':
                 "processor": processor,
                 "master_shared": master_shared,
                 "meshes_shared": meshes_shared,
+                "ghosts_shared": ghosts_shared,
             }
         )
         process.start()
@@ -398,5 +438,6 @@ if __name__ == '__main__':
 
     end = time.perf_counter()
     print(f"Done.\n (elapsed Time: {end - start} sec.)")
+
 
 
