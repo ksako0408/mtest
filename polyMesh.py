@@ -1,3 +1,41 @@
+
+from read_polyMesh import \
+    read_PointsFile, \
+    read_FacesFile, \
+    read_CellFaceFile, \
+    read_CellLevelFile, \
+    read_BoundaryFile, \
+    read_Range_of_Subdomains
+import numpy as np
+from decimal import Decimal, ROUND_HALF_UP
+from operator import itemgetter
+import re
+import pprint
+import pandas as pd
+
+# ---------------------------------------------------------------------------------------------------------------
+# Z+
+csys_v = {(-1,  1,  1): 20,  ( 0,  1,  1): 11,  ( 1,  1,  1): 19, \
+          (-1,  0,  1): 18,  ( 0,  0,  1):  5,  ( 1,  0,  1): 15, \
+          (-1, -1,  1): 21,  ( 0, -1,  1): 12,  ( 1, -1,  1): 22, \
+# Z0
+          (-1,  1,  0):  8,  ( 0,  1,  0):  2,  ( 1,  1,  0):  7, \
+          (-1,  0,  0):  3,                     ( 1,  0,  0):  1, \
+          (-1, -1,  0):  9,  ( 0, -1,  0):  4,  ( 1, -1,  0): 10, \
+# Z-
+          (-1,  1, -1): 24,  ( 0,  1, -1): 14,  ( 1,  1, -1): 23, \
+          (-1,  0, -1): 17,  ( 0,  0, -1):  6,  ( 1,  0, -1): 16, \
+          (-1, -1, -1): 25,  ( 0, -1, -1): 13,  ( 1, -1, -1): 26}
+
+csys = {v: k for k, v in csys_v.items()}
+
+csys_inv = { 1:  3,  2:  4,  3:  1,  4:  2,  5:  6,  6:  5, \
+             7:  9,  8: 10,  9:  7, 10:  8, 11: 13, 12: 14, 13: 11, 14: 12, 15: 17, 16: 18, 17: 15, 18: 16, \
+            19: 25, 20: 26, 21: 23, 22: 24, 23: 21, 24: 22, 25: 19, 26: 20}
+
+# ---------------------------------------------------------------------------------------------------------------
+
+
 def SubdomainRange(processor, range_shared):
     points = read_PointsFile(processor)
     cellLevel = read_CellLevelFile(processor)
@@ -6,18 +44,20 @@ def SubdomainRange(processor, range_shared):
     xmax, ymax, zmax = max_SubdomainRange
     range_shared[processor] = {"min": (xmin, ymin, zmin), "max": (xmax, ymax, zmax), "max_cellLevel": max(cellLevel)}
 
-    np.set_printoptions(precision = 8, floatmode = "fixed", suppress = True)
-    print(f"\t{processor}: min: {np.array(min_SubdomainRange)}, max: {np.array(max_SubdomainRange)}")
+    # np.set_printoptions(precision = 8, floatmode = "fixed", suppress = True)
+    # print(f"\t{processor}: min: {np.array(min_SubdomainRange)}, max: {np.array(max_SubdomainRange)}")
 
 
-def import_polyMesh(processor, base_size, shift, max_cellLevel, master_shared):
+def import_polyMesh(processor, base_size, range_shared, master_shared):
     points = read_PointsFile(processor)
     faces = read_FacesFile(processor)
     owner = read_CellFaceFile(processor, "owner")
     neighbour = read_CellFaceFile(processor, "neighbour")
     boundaries = read_BoundaryFile(processor)
 
+    max_cellLevel = np.max(np.array([v["max_cellLevel"] for v in range_shared.values()]))
     normalized_Length = (2 ** (max_cellLevel + 1)) / base_size
+    shift = range_shared["processor0"]["min"]
 
     p = np.array(points)
     p = (p - shift) * normalized_Length
@@ -26,6 +66,28 @@ def import_polyMesh(processor, base_size, shift, max_cellLevel, master_shared):
                           int(Decimal(v[1]).quantize(Decimal('0'), rounding=ROUND_HALF_UP)), \
                           int(Decimal(v[2]).quantize(Decimal('0'), rounding=ROUND_HALF_UP))), \
                           dtype = np.int32) for i, v in enumerate(p)}
+
+    range_proc = range_shared[processor]
+    nmin_p = (np.array(range_proc["min"]) - shift) * normalized_Length
+    nmax_p = (np.array(range_proc["max"]) - shift) * normalized_Length
+    nmin_x = int(Decimal(nmin_p[0]).quantize(Decimal('0'), rounding=ROUND_HALF_UP))
+    nmin_y = int(Decimal(nmin_p[1]).quantize(Decimal('0'), rounding=ROUND_HALF_UP))
+    nmin_z = int(Decimal(nmin_p[2]).quantize(Decimal('0'), rounding=ROUND_HALF_UP))
+    nmax_x = int(Decimal(nmax_p[0]).quantize(Decimal('0'), rounding=ROUND_HALF_UP))
+    nmax_y = int(Decimal(nmax_p[1]).quantize(Decimal('0'), rounding=ROUND_HALF_UP))
+    nmax_z = int(Decimal(nmax_p[2]).quantize(Decimal('0'), rounding=ROUND_HALF_UP))
+    nmin = (nmin_x, nmin_y, nmin_z)
+    nmax = (nmax_x, nmax_y, nmax_z)
+ 
+    range_dict = range_shared[processor]
+    range_dict["nmin"] = nmin
+    range_dict["nmax"] = nmax
+    range_dict["normalized_Length"] = normalized_Length
+    range_dict["shift"] = shift
+    range_shared[processor] = range_dict
+    np.set_printoptions(precision = 8, floatmode = "fixed", suppress = True)
+    print(f"\t{processor}: min: {range_dict["nmin"]}, max: {range_dict["nmax"]}")
+
 
     owner_face = np.arange(len(owner), dtype = np.int32)
     neighbour_face = np.arange(len(neighbour), dtype = np.int32)
@@ -192,8 +254,7 @@ def generate_LinkWiseLattice(processor, master_shared, meshes_shared, ghosts_sha
     ghosts_shared[processor] = pn_ghostCell_df
 
 
-def boundary_condition(processor, master_shared, meshes_shared, ghosts_shared):
-    # all_processor = list(master_shared.keys())
+def boundary_condition(processor, master_shared, meshes_shared, ghosts_shared, range_shared):
     Lattice_df = meshes_shared[processor]
     Master_df = master_shared[processor]
     pn_ghost_df = ghosts_shared[processor]
@@ -223,66 +284,85 @@ def boundary_condition(processor, master_shared, meshes_shared, ghosts_shared):
     _unknown_df["boundaryType"] = "unknown"
     _unknown_df["boundaryName"] = "unknown"
 
-    # face_contact_ghostCell_df = pd.DataFrame(_list).set_axis(["ghostCell", "cell", "csys", "boundaryType", "boundaryName"], axis = "columns")
 
-    _df = Master_df[["cell", "fcsys", "boundaryType", "boundaryName"]].query("boundaryType != 'InternalFace'")
-    cells = np.array(_df["cell"])
-    fcsys = np.array(_df["fcsys"])
-    boundaryTypes = np.array(_df["boundaryType"])
-    boundaryNames = np.array(_df["boundaryName"])
+    _ = Master_df[["cell", "fcsys", "boundaryType", "boundaryName"]].query("boundaryType != 'InternalFace'")
+    cells = np.array(_["cell"])
+    fcsys = np.array(_["fcsys"])
+    boundaryTypes = np.array(_["boundaryType"])
+    boundaryNames = np.array(_["boundaryName"])
     _list = [[csys_array[n][k-1], n, csys_inv[k], boundaryType, boundaryName]
              for n, k, boundaryType, boundaryName in zip(cells, fcsys, boundaryTypes, boundaryNames)] 
-
     _df = pd.DataFrame(_list).set_axis(["ghostCell", "cell", "csys", "boundaryType", "boundaryName"], axis = "columns")
 
 
+    ref_boundaryType = ["processor", "InternalFace_mbFine", "InternalFace_mbCoarse", "processor_mbFine", "processor_mbCoarse"]
+    ref_isin = _df["boundaryType"].isin(ref_boundaryType)
+    _ref_df = _df[ref_isin].drop_duplicates(subset="ghostCell")
+    # _ref_df = _df.query(
+    #       "boundaryType == 'processor' \
+    #     or boundaryType == 'InternalFace_mbFine' \
+    #     or boundaryType == 'InternalFace_mbCoarse' \
+    #     or boundaryType == 'processor_mbFine' \
+    #     or boundaryType == 'processor_mbCoarse'"
+    # ).drop_duplicates(subset="ghostCell")
+    _unknown_list = np.array(_unknown_df["ghostCell"])
+    _list = np.array(_ref_df["ghostCell"])
+    drop_indexes = np.isin(_unknown_list, _list, invert=True)
+    _unknown_df = _unknown_df[drop_indexes]
 
 
-    def reduce(df, unknown):
-        if df.empty or unknown.empty: return df, unknown
-        _ = df.drop_duplicates(subset="ghostCell")
-        drop_index = np.array(_["ghostCell"])
-        __ = unknown
-        _list = np.array(__["ghostCell"])
-        unknown_index = np.any(np.array([_list == n for n in drop_index]), axis=0)
-        __.drop(__[unknown_index].index, inplace=True)
-        return _, __
-
-    _processor_df = _df.query("boundaryType == 'processor'")
-    _processor_df, _unknown_df = reduce(_processor_df, _unknown_df)
-
-    _internal_mbFine_df = _df.query("boundaryType == 'InternalFace_mbFine'")
-    _internal_mbFine_df, _unknown_df = reduce(_internal_mbFine_df, _unknown_df)
-
-    _internal_mbCoarse_df = _df.query("boundaryType == 'InternalFace_mbCoarse'")
-    _internal_mbCoarse_df, _unknown_df = reduce(_internal_mbCoarse_df, _unknown_df)
-
-    _processor_mbFine_df = _df.query("boundaryType == 'processor_mbFine'")
-    _processor_mbFine_df, _unknown_df = reduce(_processor_mbFine_df, _unknown_df)
-
-    _processor_mbCoarse_df = _df.query("boundaryType == 'processor_mbCoarse'")
-    _processor_mbCoarse_df, _unknown_df = reduce(_processor_mbCoarse_df, _unknown_df)
-
-    unique_unknown_list = np.unique(np.array(_unknown_df["ghostCell"]))
+    bnd_isin = ~ref_isin
+    _bnd_df = _df[bnd_isin].drop_duplicates(subset="ghostCell")
+    # _bnd_df = _df.query(
+    #       "boundaryType != 'processor' \
+    #     or boundaryType != 'InternalFace_mbFine' \
+    #     or boundaryType != 'InternalFace_mbCoarse' \
+    #     or boundaryType != 'processor_mbFine' \
+    #     or boundaryType != 'processor_mbCoarse'"
+    # ).drop_duplicates(subset="ghostCell")
+    _unknown_list = np.array(_unknown_df["ghostCell"])
+    _list = np.array(_bnd_df["ghostCell"])
+    bnd_indexes = np.isin(_unknown_list, _list)
+    _unknown_bnd_df = _unknown_df[bnd_indexes]
+    ref_indexes = ~bnd_indexes
+    _unknown_ref_df = _unknown_df[ref_indexes]
 
 
-    pn_ghost_dict = {gn: (nx, ny, nz) for nx, ny, nz, gn in np.array(pn_ghost_df)}
-    pn_unknown_dict = {pn_ghost_dict[gn]: gn for gn in unique_unknown_list}
+    unique_unknown_ref_list = np.unique(np.array(_unknown_ref_df["ghostCell"]))
+    _pn = {gn: (nx, ny, nz) for nx, ny, nz, gn in np.array(pn_ghost_df)}
+    _pn_unknown = {_pn[gn]: gn for gn in unique_unknown_ref_list}
 
-    all_master_df = [df for df in master_shared.values()]
+
+    all_processor = list(range_shared.keys())
+    proc_range = {proc: d for proc, d in range_shared.items()}
+    this_range = proc_range[processor]
+    nmin = this_range["nmin"]
+    nmax = this_range["nmax"]
+    pnmin = {proc: d["nmin"] for proc, d in proc_range.items()}
+    pnmax = {proc: d["nmax"] for proc, d in proc_range.items()}
+
+    contact_procList = [proc for proc in all_processor
+                        if (nmax[0] >= pnmin[proc][0]) and (nmin[0] <= pnmax[proc][0]) and \
+                           (nmax[1] >= pnmin[proc][1]) and (nmin[1] <= pnmax[proc][1]) and \
+                           (nmax[2] >= pnmin[proc][2]) and (nmin[2] <= pnmax[proc][2])
+                        ]
+
+    print(contact_procList)
+    all_master_df = [master_shared[proc] for proc in contact_procList]
+    # all_master_df = [df for df in master_shared.values()]
     all_pmin = np.concatenate([np.array(df[["cell", "fxmin", "fymin", "fzmin"]].groupby("cell").min()) for df in all_master_df])
     all_pmax = np.concatenate([np.array(df[["cell", "fxmax", "fymax", "fzmax"]].groupby("cell").max()) for df in all_master_df])
     all_proc = np.concatenate([np.array(df[["cell", "processor"]].groupby("cell", as_index = False).max()) for df in all_master_df])
 
-    is_included = np.array(
-        [np.all([all_pmin[:, 0] <= gn[0], gn[0] <= all_pmax[:, 0],
-                 all_pmin[:, 1] <= gn[1], gn[1] <= all_pmax[:, 1],
-                 all_pmin[:, 2] <= gn[2], gn[2] <= all_pmax[:, 2]
-                 ], axis = 0) for gn in pn_unknown_dict])
-    all_cell_index = all_proc[:, 0]
-    all_proc_index = all_proc[:, 1]
-    cell_related_unDefined_GCell = [all_cell_index[isin] for isin in is_included]
-    proc_related_unDefined_GCell = [all_proc_index[isin] for isin in is_included]
+    # is_included = np.array(
+    #     [np.all([all_pmin[:, 0] <= gn[0], gn[0] <= all_pmax[:, 0],
+    #              all_pmin[:, 1] <= gn[1], gn[1] <= all_pmax[:, 1],
+    #              all_pmin[:, 2] <= gn[2], gn[2] <= all_pmax[:, 2]
+    #              ], axis = 0) for gn in _pn_unknown])
+    # all_cell_index = all_proc[:, 0]
+    # all_proc_index = all_proc[:, 1]
+    # cell_related_unDefined_GCell = [all_cell_index[isin] for isin in is_included]
+    # proc_related_unDefined_GCell = [all_proc_index[isin] for isin in is_included]
 
 
 
@@ -290,8 +370,8 @@ def boundary_condition(processor, master_shared, meshes_shared, ghosts_shared):
 
     if processor == "processor0":
         print("")
-        # print(unique_unknown_list)
-        # print(_processor_df)
+        # print(proc_pmin)
+        # print(proc_pmax)
         # print(_internal_mbFine_df)
         # print(_internal_mbCoarse_df)
         # print(_processor_mbFine_df)
@@ -359,7 +439,6 @@ def boundary_condition(processor, master_shared, meshes_shared, ghosts_shared):
 
 
 
-
 if __name__ == '__main__':
     from multiprocessing import Process, Manager, Array, Value, Lock
     import logging
@@ -414,8 +493,8 @@ if __name__ == '__main__':
 
 
     start = time.perf_counter()
-    shift = range_shared["processor0"]["min"]
-    max_cellLevel = range_shared["processor0"]["max_cellLevel"]
+    # shift = range_shared["processor0"]["min"]
+    # max_cellLevel = range_shared["processor0"]["max_cellLevel"]
     master_shared = manager.dict()
     process_list = list()
     for processor in processor_list:
@@ -424,8 +503,7 @@ if __name__ == '__main__':
             kwargs = {
                 "processor": processor,
                 "base_size": base_size,
-                "shift": shift,
-                "max_cellLevel": max_cellLevel,
+                "range_shared": range_shared,
                 "master_shared": master_shared,
             }
         )
@@ -487,6 +565,7 @@ if __name__ == '__main__':
                 "master_shared": master_shared,
                 "meshes_shared": meshes_shared,
                 "ghosts_shared": ghosts_shared,
+                "range_shared": range_shared,
             }
         )
         process.start()
@@ -505,6 +584,8 @@ if __name__ == '__main__':
 
     end = time.perf_counter()
     print(f"Done.\n (elapsed Time: {end - start} sec.)")
+
+
 
 
 
