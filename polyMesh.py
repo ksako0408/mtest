@@ -255,18 +255,16 @@ def generate_LinkWiseLattice(processor, master_shared, meshes_shared, ghosts_sha
 
 
 def boundary_condition(processor, master_shared, meshes_shared, ghosts_shared, range_shared):
-    Lattice_df = meshes_shared[processor]
-    Master_df = master_shared[processor]
-    pn_ghost_df = ghosts_shared[processor]
-
-    csys_array = np.array(Lattice_df.filter(like = "csys_", axis = 1))
     # size = np.array(Lattice_df["size"])
     # pn = np.array(Lattice_df[["nx", "ny", "nz"]])
     # unique_innerCell_list = np.array(Lattice_df["cell"])
     # n_innerCell = np.max(unique_innerCell_list)
+    Lattice_df = meshes_shared[processor]
+    Master_df = master_shared[processor]
+    pn_ghost_df = ghosts_shared[processor]
+
     unique_ghostCell_list = np.array(pn_ghost_df["ghostCell"])
-
-
+    csys_array = np.array(Lattice_df.filter(like = "csys_", axis = 1))
     csys_array_flatten = csys_array.flatten()
     _dict = {k: list() for k in csys_array_flatten}
     [_dict[k].append(i) for i, k in enumerate(csys_array_flatten)]
@@ -274,15 +272,25 @@ def boundary_condition(processor, master_shared, meshes_shared, ghosts_shared, r
     _cell = _list[:, 0]
     _csys = np.array([csys_inv[k + 1] for k in _list[:, 1]])
     _ghost = np.array([gn for gn in unique_ghostCell_list for _ in _dict[gn]])
-    _unknown_df = pd.DataFrame(
+    # _unknown_df = pd.DataFrame(
+    #     {
+    #         "ghostCell": _ghost,
+    #         "cell": _cell,
+    #         "csys": _csys,
+    #     }
+    # )
+    # _unknown_df["boundaryType"] = "unknown"
+    # _unknown_df["boundaryName"] = "unknown"
+    # ghostCell_df = _unknown_df
+    ghostCell_df = pd.DataFrame(
         {
             "ghostCell": _ghost,
             "cell": _cell,
             "csys": _csys,
         }
     )
-    _unknown_df["boundaryType"] = "unknown"
-    _unknown_df["boundaryName"] = "unknown"
+    ghostCell_df["boundaryType"] = "unknown"
+    ghostCell_df["boundaryName"] = "unknown"
 
 
     _ = Master_df[["cell", "fcsys", "boundaryType", "boundaryName"]].query("boundaryType != 'InternalFace'")
@@ -290,47 +298,92 @@ def boundary_condition(processor, master_shared, meshes_shared, ghosts_shared, r
     fcsys = np.array(_["fcsys"])
     boundaryTypes = np.array(_["boundaryType"])
     boundaryNames = np.array(_["boundaryName"])
+
+    is_mbFine = np.isin(boundaryTypes, ["InternalFace_mbFine", "processor_mbFine"])
+    boundaryTypes = np.where(is_mbFine, "mbFine", boundaryTypes)
+    is_mbCoarse = np.isin(boundaryTypes, ["InternalFace_mbCoarse", "processor_mbCoarse"])
+    boundaryTypes = np.where(is_mbCoarse, "mbCoarse", boundaryTypes)
+
     _list = [[csys_array[n][k-1], n, csys_inv[k], boundaryType, boundaryName]
-             for n, k, boundaryType, boundaryName in zip(cells, fcsys, boundaryTypes, boundaryNames)] 
-    _df = pd.DataFrame(_list).set_axis(["ghostCell", "cell", "csys", "boundaryType", "boundaryName"], axis = "columns")
+             for n, k, boundaryType, boundaryName in zip(cells, fcsys, boundaryTypes, boundaryNames)]
+    faceContact_df = pd.DataFrame(_list).set_axis(["ghostCell", "cell", "csys", "boundaryType", "boundaryName"], axis = "columns")
+    faceContact_df = faceContact_df.drop_duplicates(subset=["ghostCell", "cell", "csys", "boundaryType"])
+
+    _ = pd.merge(ghostCell_df, faceContact_df, how="outer", on=["ghostCell", "cell", "csys"], indicator=True)
+    # print(f"{processor}: {_.shape}, {ghostCell_df.shape}")
+    # if processor == "processor0":
+    #     print(_.shape, ghostCell_df.shape, processor)
+    #     a = _df[["ghostCell", "cell", "csys"]].drop_duplicates(keep=False)
+    #     b = _df[["ghostCell", "cell", "csys"]]
+    #     c = pd.merge(b, a, how="outer", indicator=True).query("_merge=='left_only'")
+    #     print(c)
+    #     print(_df.query("ghostCell==3352 and cell==241 and csys==4"))
+    boundaryType_x = _["boundaryType_x"]
+    boundaryType_y = _["boundaryType_y"]
+    boundaryName_x = _["boundaryName_x"]
+    boundaryName_y = _["boundaryName_y"]
+    indicator = _["_merge"]
+    boundaryType = np.where(indicator == "both", boundaryType_y, boundaryType_x)
+    boundaryName = np.where(indicator == "both", boundaryName_y, boundaryName_x)
+    ghostCell_df["boundaryType"] = boundaryType
+    ghostCell_df["boundaryName"] = boundaryName
+
+    ref_boundaryType = ["processor", "mbFine", "mbCoarse"]
+    ref_df = ghostCell_df[ghostCell_df["boundaryType"].isin(ref_boundaryType)]
+    ref_df = ref_df.drop_duplicates(subset="ghostCell")
+
+    _ = np.unique(np.array(ref_df["ghostCell"]))
+    ghostCell_df = ghostCell_df[~ghostCell_df["ghostCell"].isin(_)]
 
 
-    ref_boundaryType = ["processor", "InternalFace_mbFine", "InternalFace_mbCoarse", "processor_mbFine", "processor_mbCoarse"]
-    ref_isin = _df["boundaryType"].isin(ref_boundaryType)
-    _ref_df = _df[ref_isin].drop_duplicates(subset="ghostCell")
-    # _ref_df = _df.query(
-    #       "boundaryType == 'processor' \
-    #     or boundaryType == 'InternalFace_mbFine' \
-    #     or boundaryType == 'InternalFace_mbCoarse' \
-    #     or boundaryType == 'processor_mbFine' \
-    #     or boundaryType == 'processor_mbCoarse'"
-    # ).drop_duplicates(subset="ghostCell")
-    _unknown_list = np.array(_unknown_df["ghostCell"])
-    _list = np.array(_ref_df["ghostCell"])
-    drop_indexes = np.isin(_unknown_list, _list, invert=True)
-    _unknown_df = _unknown_df[drop_indexes]
+    boundaryType = np.array(ghostCell_df["boundaryType"])
+    ghostCell = np.array(ghostCell_df["ghostCell"])
+    cell_csys = np.array(ghostCell_df["csys"])
 
+    _df = ghostCell_df.query("boundaryType != 'unknown'")
+    _ = np.unique(np.array(_df["ghostCell"]))
+    is_bnd = [ghostCell == gn for gn in _]
 
-    bnd_isin = ~ref_isin
-    _bnd_df = _df[bnd_isin].drop_duplicates(subset="ghostCell")
-    # _bnd_df = _df.query(
-    #       "boundaryType != 'processor' \
-    #     or boundaryType != 'InternalFace_mbFine' \
-    #     or boundaryType != 'InternalFace_mbCoarse' \
-    #     or boundaryType != 'processor_mbFine' \
-    #     or boundaryType != 'processor_mbCoarse'"
-    # ).drop_duplicates(subset="ghostCell")
-    _unknown_list = np.array(_unknown_df["ghostCell"])
-    _list = np.array(_bnd_df["ghostCell"])
-    bnd_indexes = np.isin(_unknown_list, _list)
-    _unknown_bnd_df = _unknown_df[bnd_indexes]
-    ref_indexes = ~bnd_indexes
-    _unknown_ref_df = _unknown_df[ref_indexes]
+    edge_boundary_of_face = {
+        1: (19, 15, 22,  7, 10, 23, 16, 26),
+        2: (20, 11, 19,  8,  7, 24, 14, 23),
+        3: (20, 18, 21,  8,  9, 24, 17, 25),
+        4: (21, 12, 22,  9, 10, 25, 13, 26),
+        5: (20, 11, 19, 18, 15, 21, 12, 22),
+        6: (24, 14, 23, 17, 16, 25, 13, 26)}
 
+    def assign(_):
+        csys = cell_csys[_]
+        boundary = boundaryType[_]
+        for i, k in enumerate(csys):
+            if k > 6: continue
+            boundary[np.isin(csys, edge_boundary_of_face[k])] = boundary[i]
+        boundaryType[_] = boundary
+        return None
+    [assign(_) for _ in is_bnd]
+    ghostCell_df["boundaryType"] = boundaryType
+    ghostCell_df = pd.concat([ref_df, ghostCell_df], axis=0)
 
-    unique_unknown_ref_list = np.unique(np.array(_unknown_ref_df["ghostCell"]))
-    _pn = {gn: (nx, ny, nz) for nx, ny, nz, gn in np.array(pn_ghost_df)}
-    _pn_unknown = {_pn[gn]: gn for gn in unique_unknown_ref_list}
+    # ref_boundaryType = ["processor", "InternalFace_mbFine", "InternalFace_mbCoarse", "processor_mbFine", "processor_mbCoarse"]
+    # ref_isin = _df["boundaryType"].isin(ref_boundaryType)
+    # _ref_df = _df[ref_isin].drop_duplicates(subset="ghostCell")
+    # _unknown_list = np.array(_unknown_df["ghostCell"])
+    # _list = np.array(_ref_df["ghostCell"])
+    # drop_indexes = np.isin(_unknown_list, _list, invert=True)
+    # _unknown_df = _unknown_df[drop_indexes]
+
+    # bnd_isin = ~ref_isin
+    # _bnd_df = _df[bnd_isin].drop_duplicates(subset="ghostCell")
+    # _unknown_list = np.array(_unknown_df["ghostCell"])
+    # _list = np.array(_bnd_df["ghostCell"])
+    # bnd_indexes = np.isin(_unknown_list, _list)
+    # _unknown_bnd_df = _unknown_df[bnd_indexes]
+    # ref_indexes = ~bnd_indexes
+    # _unknown_ref_df = _unknown_df[ref_indexes]
+
+    # unique_unknown_ref_list = np.unique(np.array(_unknown_ref_df["ghostCell"]))
+    # _pn = {gn: (nx, ny, nz) for nx, ny, nz, gn in np.array(pn_ghost_df)}
+    # _pn_unknown = {_pn[gn]: gn for gn in unique_unknown_ref_list}
 
 
     all_processor = list(range_shared.keys())
@@ -346,30 +399,84 @@ def boundary_condition(processor, master_shared, meshes_shared, ghosts_shared, r
                            (nmax[1] >= pnmin[proc][1]) and (nmin[1] <= pnmax[proc][1]) and \
                            (nmax[2] >= pnmin[proc][2]) and (nmin[2] <= pnmax[proc][2])
                         ]
-
     print(contact_procList)
+
     all_master_df = [master_shared[proc] for proc in contact_procList]
-    # all_master_df = [df for df in master_shared.values()]
     all_pmin = np.concatenate([np.array(df[["cell", "fxmin", "fymin", "fzmin"]].groupby("cell").min()) for df in all_master_df])
     all_pmax = np.concatenate([np.array(df[["cell", "fxmax", "fymax", "fzmax"]].groupby("cell").max()) for df in all_master_df])
-    all_proc = np.concatenate([np.array(df[["cell", "processor"]].groupby("cell", as_index = False).max()) for df in all_master_df])
+    all_pn = np.concatenate([np.array(df[["cell", "nx", "ny", "nz"]].groupby("cell").max()) for df in all_master_df])
+    _ = np.concatenate([np.array(df[["cell", "processor"]].groupby("cell", as_index = False).max()) for df in all_master_df])
+    all_cell_index = _[:, 0]
+    all_proc_index = _[:, 1]
 
-    # is_included = np.array(
-    #     [np.all([all_pmin[:, 0] <= gn[0], gn[0] <= all_pmax[:, 0],
-    #              all_pmin[:, 1] <= gn[1], gn[1] <= all_pmax[:, 1],
-    #              all_pmin[:, 2] <= gn[2], gn[2] <= all_pmax[:, 2]
-    #              ], axis = 0) for gn in _pn_unknown])
-    # all_cell_index = all_proc[:, 0]
-    # all_proc_index = all_proc[:, 1]
+
+    is_unknown = (ghostCell_df["boundaryType"] == "unknown")
+    _df = ghostCell_df[is_unknown]
+
+    unique_unknown_list = np.unique(np.array(_df["ghostCell"]))
+    _pn = {gn: (nx, ny, nz) for nx, ny, nz, gn in np.array(pn_ghost_df)}
+    gn_unknown = {_pn[gn]: gn for gn in unique_unknown_list}
+
+    is_included = {k: np.all(
+               [all_pmin[:, 0] <= pn[0], pn[0] <= all_pmax[:, 0],
+                all_pmin[:, 1] <= pn[1], pn[1] <= all_pmax[:, 1],
+                all_pmin[:, 2] <= pn[2], pn[2] <= all_pmax[:, 2]
+                ], axis = 0) for pn, k in gn_unknown.items()}
+    n_included = {k: np.count_nonzero(counted) for k, counted in is_included.items()}
+
+    ghostCell = np.array(_df["ghostCell"])
+    boundaryType = np.array(_df["boundaryType"])
+    boundaryName = np.array(_df["boundaryName"])
+
+    temporary_wall = [k for k, n in n_included.items() if n == 0]
+    is_temporary_wall = np.isin(ghostCell, temporary_wall)
+    boundaryType[is_temporary_wall] = "wall"
+    boundaryName[is_temporary_wall] = "temporary_wall"
+
+    mbFine = [k for k, n in n_included.items() if n == 8]
+    is_mbFine = np.isin(ghostCell, mbFine)
+    boundaryType[is_mbFine] = "mbFine"
+
+    _ = [k for k, n in n_included.items() if n == 1]
+    one_included = {_pn[gn]: gn for gn in _}
+    is_equal = {k: np.any(np.all([all_pn[:, 0] == pn[0],
+                                  all_pn[:, 1] == pn[1],
+                                  all_pn[:, 2] == pn[2]
+                                  ], axis = 0)) for pn, k in one_included.items()}
+
+    processor_cell = [k for k, equal in is_equal.items() if equal]
+    is_processor = np.isin(ghostCell, processor_cell)
+    boundaryType[is_processor] = "processor"
+
+    mbCoarse = [k for k, equal in is_equal.items() if not equal]
+    is_mbCoarse = np.isin(ghostCell, mbCoarse)
+    boundaryType[is_mbCoarse] = "mbCoarse"
+
+
+    _boundaryType = np.array(ghostCell_df["boundaryType"])
+    _boundaryType[is_unknown] = boundaryType
+    _boundaryName = np.array(ghostCell_df["boundaryName"])
+    _boundaryName[is_unknown] = boundaryName
+    ghostCell_df["boundaryType"] = _boundaryType
+    ghostCell_df["boundaryName"] = _boundaryName
+
+
     # cell_related_unDefined_GCell = [all_cell_index[isin] for isin in is_included]
     # proc_related_unDefined_GCell = [all_proc_index[isin] for isin in is_included]
-
-
+    # temporary_wall_list = unique_unknown_ref_list[n_included == 0]
+    # mbFine_list = unique_unknown_ref_list[n_included == 8]
 
 
 
     if processor == "processor0":
         print("")
+        print(ghostCell_df.query("boundaryType == 'unknown'"))
+        print(ghostCell_df.query("boundaryType == 'processor'"))
+        print(ghostCell_df.query("boundaryType == 'mbFine'"))
+        print(ghostCell_df.query("boundaryType == 'mbCoarse'"))
+        # print(n_included)
+    #     print(temporary_wall_list)
+    #     print(mbFine_list)
         # print(proc_pmin)
         # print(proc_pmax)
         # print(_internal_mbFine_df)
@@ -432,6 +539,7 @@ def boundary_condition(processor, master_shared, meshes_shared, ghosts_shared, r
         # print(len(edge_contanct_ghostCell))
         # print(tmp_df)
         # pprint.pprint(cell_related_unDefined_GCell)
+
 
 
 
