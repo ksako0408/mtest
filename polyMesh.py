@@ -541,6 +541,44 @@ def boundary_condition(processor, master_shared, meshes_shared, ghosts_shared, r
         # pprint.pprint(cell_related_unDefined_GCell)
 
 
+    ghostCell = np.array(ghostCell_df["ghostCell"])
+    boundaryType_dict = {gn: t for gn, t in zip(ghostCell, boundaryType)}
+
+    proc_dict = {gn: np.array([all_cell_index[isin], all_proc_index[isin]])
+                 for gn, isin in is_included.items() if boundaryType_dict[gn] == "processor"}
+
+
+    mbFine_dict = {gn: np.array([all_cell_index[isin], all_proc_index[isin]])
+                   for gn, isin in is_included.items() if boundaryType_dict[gn] == "mbFine"}
+
+    all_cell_index = {gn: all_cell_index[isin] for gn, isin in is_included.items() if not n_included[gn] == 0}
+    all_proc_index = {gn: all_proc_index[isin] for gn, isin in is_included.items() if not n_included[gn] == 0}
+    all_pn = {gn: all_pn[isin] for gn, isin in is_included.items() if not n_included[gn] == 0}
+
+    mbCoarse = [k for k, equal in is_equal.items() if not equal]
+    is_mbCoarse = np.isin(ghostCell, mbCoarse)
+    boundaryType[is_mbCoarse] = "mbCoarse"
+
+    def mbsys(CoarseCell, pn):
+        ni = pn - CoarseCell
+        ni = ni // np.abs(np.max(ni))
+        csys = csys_v[tuple(ni)]
+        return csys
+
+    # mbCoarse_dict = {gn: np.array([all_cell_index[isin], all_proc_index[isin], [mbsys(all_pn[isin][0], _pn[gn])]])
+    #                  for gn, isin in is_included.items() if boundaryType_dict[gn] == "mbCoarse"}
+    # mbCoarse_dict = {gn: np.array([all_cell_index[gn], all_proc_index[gn], [mbsys(all_pn[gn][0], _pn[gn])]]).flatten()
+    #                  for gn in mbCoarse}
+    mbCoarse_dict = {"ghostCell": mbCoarse,
+                     "cell": np.array([all_cell_index[gn] for gn in mbCoarse]).flatten(),
+                     "processor": np.array([all_proc_index[gn] for gn in mbCoarse]).flatten(),
+                     "csys": np.array([mbsys(all_pn[gn][0], _pn[gn]) for gn in mbCoarse])}
+    mbCoarse_df = pd.DataFrame.from_dict(mbCoarse_dict)
+
+
+
+
+
 
 
 
